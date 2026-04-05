@@ -85,7 +85,6 @@ def calculate_course_grade(categories: list[dict]) -> dict:
         - is_incomplete: bool
         - completed_weight: float  (sum of weights for completed categories)
     """
-    total_weight = 0.0
     earned_weight = 0.0
     completed_weight = 0.0
     is_incomplete = False
@@ -103,7 +102,6 @@ def calculate_course_grade(categories: list[dict]) -> dict:
         score = float(score)
         earned_weight += (score / 100.0) * weight
         completed_weight += weight
-        total_weight += weight
 
     if completed_weight == 0:
         return {
@@ -213,7 +211,8 @@ def what_score_needed(
 
     needed = (target_percentage * 100 - current_score * current_weight_completed) / final_weight
 
-    if needed > 100 or needed < 0:
+    if needed > 100 or needed < -0.05:
         return None
+    needed = max(needed, 0.0)
 
     return round(needed, 1)

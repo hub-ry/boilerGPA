@@ -3,6 +3,7 @@ BoilerGPA Backend — FastAPI Application
 Purdue University GPA prediction tool powered by Claude AI.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -11,9 +12,12 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 import db as database
 from calculator import calculate_overall_gpa, what_score_needed
@@ -33,6 +37,8 @@ logger = logging.getLogger("boilergpa")
 # Environment
 # ---------------------------------------------------------------------------
 load_dotenv()
+
+limiter = Limiter(key_func=get_remote_address)
 
 
 # ---------------------------------------------------------------------------
@@ -61,10 +67,15 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+_cors_raw = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+_cors_origins = [o.strip() for o in _cors_raw.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -111,6 +122,7 @@ class FinalScoreNeededRequest(BaseModel):
     current_score: float
     completed_weight: float
     final_weight: float
+    grading_scale: dict = Field(default_factory=lambda: {"A": 90, "B": 80, "C": 70, "D": 60})
 
 
 class GradeSubmissionEntry(BaseModel):
@@ -177,7 +189,8 @@ async def health_check():
 
 
 @app.post("/parse-syllabus")
-async def parse_syllabus(file: UploadFile = File(...)):
+@limiter.limit("10/minute")
+async def parse_syllabus(request: Request, file: UploadFile = File(...)):
     """
     Accept a PDF syllabus upload, extract text with PyMuPDF,
     send to Gemini, and return structured grading data.
@@ -324,7 +337,8 @@ async def search_courses(q: str = Query(..., min_length=2, description="Search q
 
 
 @app.post("/submit-grades")
-async def submit_grades(request: GradeSubmissionRequest):
+@limiter.limit("5/minute")
+async def submit_grades(request: Request, body: GradeSubmissionRequest):
     """
     Accept anonymous grade submissions from users.
 
@@ -333,12 +347,15 @@ async def submit_grades(request: GradeSubmissionRequest):
     These aggregate submissions are used to build per-course grade distributions
     for future curve predictions.
     """
-    if not request.entries:
+    if not body.entries:
         raise HTTPException(status_code=400, detail="No entries provided")
+
+    if len(body.entries) > 20:
+        raise HTTPException(status_code=400, detail="Too many entries — max 20 per submission")
 
     valid_letters = {"A", "B", "C", "D", "F"}
     entries = []
-    for e in request.entries:
+    for e in body.entries:
         letter = e.letter.upper()
         if letter not in valid_letters:
             raise HTTPException(
@@ -375,7 +392,13 @@ async def get_course_template(subject: str, number: str):
 @app.post("/what-score-needed")
 async def what_score_needed_endpoint(request: FinalScoreNeededRequest):
     """Calculate what score is needed on a final to hit each letter grade threshold."""
-    targets = {"A": 90.0, "B": 80.0, "C": 70.0, "D": 60.0}
+    scale = request.grading_scale
+    targets = {
+        "A": float(scale.get("A", 90)),
+        "B": float(scale.get("B", 80)),
+        "C": float(scale.get("C", 70)),
+        "D": float(scale.get("D", 60)),
+    }
     results = {}
     for grade, target_pct in targets.items():
         needed = what_score_needed(
@@ -396,7 +419,8 @@ async def what_score_needed_endpoint(request: FinalScoreNeededRequest):
 
 
 @app.post("/explain-curve")
-async def explain_curve(request: ExplainCurveRequest):
+@limiter.limit("30/minute")
+async def explain_curve(request: Request, body: ExplainCurveRequest):
     """
     Generate a concise, student-facing AI explanation for the curve prediction.
     Uses Claude Haiku — fast and cheap (< $0.001 per call).
@@ -411,29 +435,33 @@ async def explain_curve(request: ExplainCurveRequest):
         "class_stats": "professor-released class statistics (mean/std dev entered by the student)",
         "historical": "historical grade submissions from past students of this course",
         "none": "no historical data — only the student's raw score is available",
-    }.get(request.data_source, "available data")
+    }.get(body.data_source, "available data")
 
-    no_curve = request.curve_applied == 0
+    no_curve = body.curve_applied == 0
 
     prompt = f"""You are explaining a GPA curve prediction to a college student.
 
-Course: {request.course_name or request.course_code}
-Student's current score: {request.current_score:.1f}%
-Current letter grade (raw): {request.current_letter}
-Predicted score after curve: {request.predicted_score:.1f}%
-Predicted letter grade: {request.predicted_letter}
-Curve applied: {request.curve_applied} points
+Course: {body.course_name or body.course_code}
+Student's current score: {body.current_score:.1f}%
+Current letter grade (raw): {body.current_letter}
+Predicted score after curve: {body.predicted_score:.1f}%
+Predicted letter grade: {body.predicted_letter}
+Curve applied: {body.curve_applied} points
 Data source: {source_context}
-Confidence: {request.confidence}
+Confidence: {body.confidence}
 
-Write 2-3 sentences directly to the student explaining {"why no curve is expected" if no_curve else f"why their {request.current_score:.1f}% is predicted to be curved to a {request.predicted_letter}"}. Be specific about the numbers. Be honest about uncertainty if confidence is low or medium. Don't use bullet points. Don't start with "I"."""
+Write 2-3 sentences directly to the student explaining {"why no curve is expected" if no_curve else f"why their {body.current_score:.1f}% is predicted to be curved to a {body.predicted_letter}"}. Be specific about the numbers. Be honest about uncertainty if confidence is low or medium. Don't use bullet points. Don't start with "I"."""
 
     client = _anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=150,
-        messages=[{"role": "user", "content": prompt}],
-    )
+
+    def _call():
+        return client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+    response = await asyncio.to_thread(_call)
     explanation = response.content[0].text.strip()
 
     return {"success": True, "explanation": explanation}
@@ -485,7 +513,8 @@ async def get_community_templates(course_code: str):
 
 
 @app.post("/community/star/{template_id}")
-async def star_community_template(template_id: int):
+@limiter.limit("10/minute")
+async def star_community_template(request: Request, template_id: int):
     """Upvote a community template."""
     stars = database.star_community_template(template_id)
     if stars is None:

@@ -57,14 +57,29 @@ function normalizeCat(cat) {
   };
 }
 
-/** Get the effective numeric score for a category (null = no data yet). */
+/** Get the effective numeric score for a category (null = no data yet).
+ *  In individual mode, empty slots are filled with the average of entered scores.
+ */
 export function effectiveScore(cat) {
   if (cat.entryMode === 'individual') {
-    const nums = cat.scores.map(parseFloat).filter((n) => !isNaN(n));
-    return nums.length > 0 ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
+    const count = cat.count || 1;
+    const slots = cat.scores.length === count ? cat.scores : Array(count).fill('');
+    const nums = slots.map(parseFloat).filter((n) => !isNaN(n));
+    if (nums.length === 0) return null;
+    const avg = nums.reduce((a, b) => a + b, 0) / nums.length;
+    // All slots (including empty ones) contribute the average
+    return avg;
   }
   const v = parseFloat(cat.score);
   return isNaN(v) ? null : v;
+}
+
+/** Average of entered individual scores — used to show the auto-fill placeholder. */
+export function enteredAverage(cat) {
+  if (cat.entryMode !== 'individual') return null;
+  const nums = (cat.scores || []).map(parseFloat).filter((n) => !isNaN(n));
+  if (nums.length === 0) return null;
+  return nums.reduce((a, b) => a + b, 0) / nums.length;
 }
 
 /**
@@ -172,13 +187,45 @@ export function useDashboard() {
   const [priorHours, setPriorHours] = useState(saved?.priorHours ?? '');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [predictedResult, setPredictedResult] = useState(null);
 
   // Persist on every state change
   useEffect(() => {
     saveState({ semesters, activeSemester, priorQP, priorHours });
   }, [semesters, activeSemester, priorQP, priorHours]);
 
+  // Debounced prediction fetch — fires 1.5s after courses stop changing
   const courses = semesters[activeSemester]?.courses || [];
+  useEffect(() => {
+    if (courses.length === 0) { setPredictedResult(null); return; }
+    const hasAnyScore = courses.some((c) =>
+      c.categories.some((cat) => effectiveScore(cat) !== null)
+    );
+    if (!hasAnyScore) { setPredictedResult(null); return; }
+
+    const timer = setTimeout(async () => {
+      try {
+        // Sanitize: backend expects score as float|null, not empty string
+        const sanitized = courses.map((c) => ({
+          ...c,
+          categories: c.categories.map((cat) => ({
+            ...cat,
+            score: cat.score === '' || cat.score === undefined ? null : Number(cat.score),
+          })),
+        }));
+        const resp = await fetch(`${API_BASE}/predict-gpa`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ courses: sanitized }),
+        });
+        if (!resp.ok) return;
+        const { data } = await resp.json();
+        setPredictedResult(data);
+      } catch { /* silent fail — prediction is best-effort */ }
+    }, 1500);
+
+    return () => clearTimeout(timer);
+  }, [JSON.stringify(courses)]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- semester actions ----
 
@@ -313,15 +360,12 @@ export function useDashboard() {
       const formData = new FormData();
       formData.append('file', file);
       const resp = await fetch(`${API_BASE}/parse-syllabus`, { method: 'POST', body: formData });
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}));
-        throw new Error(err.detail || `Server error ${resp.status}`);
-      }
-      const { data } = await resp.json();
-      return data;
-    } catch (err) {
-      setError(err.message || 'Failed to parse syllabus.');
-      return null;
+      const json = await resp.json().catch(() => ({}));
+      // Always return data — backend guarantees a result (partial or full)
+      return { data: json.data || {}, partial: json.partial ?? !resp.ok };
+    } catch {
+      // Network error — return empty defaults so user can fill manually
+      return { data: {}, partial: true };
     } finally {
       setIsLoading(false);
     }
@@ -346,6 +390,35 @@ export function useDashboard() {
       const { data } = await resp.json();
       return data || null;
     } catch { return null; }
+  }, []);
+
+  const exportData = useCallback(() => {
+    const payload = { semesters, activeSemester, priorQP, priorHours };
+    const json = JSON.stringify(payload);
+    // Use encodeURIComponent to safely handle unicode, then base64 encode
+    return 'bgpa_v1_' + btoa(encodeURIComponent(json));
+  }, [semesters, activeSemester, priorQP, priorHours]);
+
+  const importData = useCallback((raw) => {
+    if (typeof raw !== 'string' || !raw.startsWith('bgpa_v1_')) {
+      throw new Error('Invalid format — must start with bgpa_v1_');
+    }
+    let data;
+    try {
+      const json = decodeURIComponent(atob(raw.slice('bgpa_v1_'.length)));
+      data = JSON.parse(json);
+    } catch {
+      throw new Error('Corrupted data — could not decode');
+    }
+    if (!data.semesters || typeof data.semesters !== 'object') {
+      throw new Error('Invalid data — missing semester data');
+    }
+    setSemesters(data.semesters);
+    if (data.activeSemester && data.semesters[data.activeSemester]) {
+      setActiveSemester(data.activeSemester);
+    }
+    if (data.priorQP !== undefined) setPriorQP(data.priorQP);
+    if (data.priorHours !== undefined) setPriorHours(data.priorHours);
   }, []);
 
   const submitGrades = useCallback(async (entriesOverride) => {
@@ -390,6 +463,8 @@ export function useDashboard() {
     searchCourses,
     fetchTemplate,
     submitGrades,
+    exportData,
+    importData,
     reorderCategories,
     priorQP,
     setPriorQP,
@@ -398,5 +473,6 @@ export function useDashboard() {
     isLoading,
     error,
     setError,
+    predictedResult,
   };
 }

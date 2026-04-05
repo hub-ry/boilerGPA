@@ -78,29 +78,20 @@
   }
 
   .gold-btn {
-    background: linear-gradient(135deg, #CFB991 0%, #b8973a 100%);
+    background: #CFB991;
     color: #0f0f0f;
     font-weight: 700;
     border-radius: 12px;
-    transition: all 0.2s ease;
-    position: relative;
-    overflow: hidden;
+    transition: background 0.15s ease, transform 0.1s ease;
   }
 
-  .gold-btn::after {
-    content: '';
-    position: absolute;
-    inset: 0;
-    background: rgba(255, 255, 255, 0);
-    transition: background 0.2s ease;
-  }
-
-  .gold-btn:hover::after {
-    background: rgba(255, 255, 255, 0.1);
+  .gold-btn:hover {
+    background: #d9c8a4;
   }
 
   .gold-btn:active {
     transform: scale(0.98);
+    background: #b8a47a;
   }
 
   .input-field {

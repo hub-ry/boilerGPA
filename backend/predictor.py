@@ -181,6 +181,47 @@ async def predict_course_grade(course: dict, current_score: float) -> dict:
             "data_source": "class_stats",
         }
 
+    # ── Path 1b: community-reported class stats from DB ───────────────────
+    if not has_current_stats and course_code:
+        community_stats = database.get_class_stats_for_course(course_code, semester)
+        if community_stats:
+            # Build fake classStats on categories for reuse of existing logic
+            merged_cats = []
+            for cat in categories:
+                cat_name = cat.get("name", "")
+                if cat_name in community_stats:
+                    items = community_stats[cat_name]
+                    fake_stats = [
+                        {"mean": item.get("mean"), "median": item.get("median"),
+                         "stdDev": item.get("std_dev"), "min": item.get("min_score"),
+                         "max": item.get("max_score")}
+                        for item in items
+                    ]
+                    merged_cats.append({**cat, "classStats": fake_stats})
+                else:
+                    merged_cats.append(cat)
+
+            community_curve, community_explanation = infer_curve_from_class_stats(merged_cats, grading_scale)
+            has_community_stats = community_curve > 0 or any(
+                isinstance(s, dict) and s.get("mean") is not None
+                for cat in merged_cats
+                for s in (cat.get("classStats") or [])
+                if isinstance(s, dict)
+            )
+            if has_community_stats:
+                predicted_score = min(100.0, current_score + community_curve)
+                predicted_letter = percentage_to_letter(predicted_score, grading_scale)
+                predicted_gpa = letter_to_gpa(predicted_letter)
+                return {
+                    "predicted_score": round(predicted_score, 2),
+                    "predicted_letter": predicted_letter,
+                    "predicted_gpa": predicted_gpa,
+                    "curve_applied": community_curve,
+                    "confidence": "high",
+                    "explanation": f"Curve estimated from community-reported class statistics. {community_explanation}".strip(),
+                    "data_source": "class_stats",
+                }
+
     # ── Path 2: crowdsourced historical data ─────────────────────────────
     subject, number = _parse_course_code(course_code)
     record = None

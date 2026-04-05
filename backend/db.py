@@ -77,6 +77,42 @@ def init_db() -> None:
                 ON grade_submissions(subject, number, instructor, semester);
             CREATE INDEX IF NOT EXISTS idx_templates_course
                 ON course_templates(subject, number);
+
+            -- Community-submitted grading structures (multiple per course, star-ranked)
+            CREATE TABLE IF NOT EXISTS community_templates (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject      TEXT    NOT NULL,
+                number       TEXT    NOT NULL,
+                course_name  TEXT    NOT NULL DEFAULT '',
+                semester     TEXT    NOT NULL DEFAULT '',
+                instructor   TEXT    NOT NULL DEFAULT '',
+                categories   TEXT    NOT NULL DEFAULT '[]',
+                credit_hours INTEGER NOT NULL DEFAULT 3,
+                grading_scale TEXT   NOT NULL DEFAULT '{"A":90,"B":80,"C":70,"D":60}',
+                stars        INTEGER NOT NULL DEFAULT 0,
+                submitted_at TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_community_templates_course
+                ON community_templates(subject, number);
+
+            -- Community-reported class statistics (crowd-sourced from students)
+            CREATE TABLE IF NOT EXISTS class_stats_reports (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                course_code  TEXT    NOT NULL,
+                category_name TEXT   NOT NULL,
+                item_index   INTEGER NOT NULL DEFAULT 0,
+                semester     TEXT    NOT NULL DEFAULT '',
+                mean         REAL,
+                median       REAL,
+                std_dev      REAL,
+                min_score    REAL,
+                max_score    REAL,
+                submitted_at TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_class_stats_course
+                ON class_stats_reports(course_code, category_name);
         """)
 
 
@@ -347,6 +383,190 @@ def upsert_course_template(
                 json.dumps(grading_scale),
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# Community templates (user-submitted grading structures)
+# ---------------------------------------------------------------------------
+
+def submit_community_template(
+    subject: str,
+    number: str,
+    course_name: str,
+    semester: str,
+    instructor: str,
+    categories: list,
+    credit_hours: int,
+    grading_scale: dict,
+) -> int:
+    """
+    Insert a new community template. If an identical category structure already
+    exists for the same course+semester, star it instead of duplicating.
+    Returns the template id.
+    """
+    subject = subject.upper()
+    cat_names_key = json.dumps(sorted(c.get("name", "") for c in categories))
+
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT id, categories FROM community_templates WHERE subject = ? AND number = ? AND semester = ?",
+            (subject, number, semester),
+        ).fetchall()
+
+        for row in existing:
+            try:
+                ec = json.loads(row["categories"])
+                if json.dumps(sorted(c.get("name", "") for c in ec)) == cat_names_key:
+                    conn.execute(
+                        "UPDATE community_templates SET stars = stars + 1 WHERE id = ?",
+                        (row["id"],),
+                    )
+                    return row["id"]
+            except Exception:
+                pass
+
+        cur = conn.execute(
+            """
+            INSERT INTO community_templates
+                (subject, number, course_name, semester, instructor, categories, credit_hours, grading_scale, stars)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                subject, number, course_name, semester, instructor,
+                json.dumps(categories), credit_hours, json.dumps(grading_scale),
+            ),
+        )
+        return cur.lastrowid
+
+
+def get_community_templates(subject: str, number: str) -> list[dict]:
+    """Return all community templates for a course, sorted by stars desc."""
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, subject, number, course_name, semester, instructor,
+                   categories, credit_hours, grading_scale, stars, submitted_at
+            FROM community_templates
+            WHERE subject = ? AND number = ?
+            ORDER BY stars DESC, submitted_at DESC
+            """,
+            (subject.upper(), number),
+        ).fetchall()
+
+    result = []
+    for row in rows:
+        d = dict(row)
+        try:
+            d["categories"] = json.loads(d["categories"])
+        except Exception:
+            d["categories"] = []
+        try:
+            d["grading_scale"] = json.loads(d["grading_scale"])
+        except Exception:
+            d["grading_scale"] = {"A": 90, "B": 80, "C": 70, "D": 60}
+        result.append(d)
+    return result
+
+
+def star_community_template(template_id: int) -> Optional[int]:
+    """Upvote a template. Returns new star count, or None if not found."""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE community_templates SET stars = stars + 1 WHERE id = ?",
+            (template_id,),
+        )
+        row = conn.execute(
+            "SELECT stars FROM community_templates WHERE id = ?", (template_id,)
+        ).fetchone()
+    return row["stars"] if row else None
+
+
+def report_class_stats(
+    course_code: str,
+    category_name: str,
+    item_index: int,
+    semester: str,
+    mean: Optional[float],
+    median: Optional[float],
+    std_dev: Optional[float],
+    min_score: Optional[float],
+    max_score: Optional[float],
+) -> None:
+    """Record a student's report of class statistics for a specific exam/assignment."""
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO class_stats_reports
+                (course_code, category_name, item_index, semester, mean, median, std_dev, min_score, max_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (course_code.upper(), category_name, item_index, semester, mean, median, std_dev, min_score, max_score),
+        )
+
+
+def get_class_stats_for_course(course_code: str, semester: str = "") -> dict:
+    """
+    Return aggregated community class stats for all categories of a course.
+    Groups by category_name + item_index, averages reported values.
+    Result: { category_name: [ {mean, median, std_dev, min_score, max_score, report_count}, ... ] }
+    Ordered by item_index within each category.
+    """
+    code = course_code.upper()
+    with get_db() as conn:
+        if semester:
+            rows = conn.execute(
+                """
+                SELECT category_name, item_index,
+                       AVG(mean) AS mean, AVG(median) AS median,
+                       AVG(std_dev) AS std_dev, AVG(min_score) AS min_score,
+                       AVG(max_score) AS max_score, COUNT(*) AS report_count
+                FROM class_stats_reports
+                WHERE course_code = ? AND semester = ?
+                GROUP BY category_name, item_index
+                ORDER BY category_name, item_index
+                """,
+                (code, semester),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT category_name, item_index,
+                       AVG(mean) AS mean, AVG(median) AS median,
+                       AVG(std_dev) AS std_dev, AVG(min_score) AS min_score,
+                       AVG(max_score) AS max_score, COUNT(*) AS report_count
+                FROM class_stats_reports
+                WHERE course_code = ?
+                GROUP BY category_name, item_index
+                ORDER BY category_name, item_index
+                """,
+                (code,),
+            ).fetchall()
+
+    result: dict = {}
+    for row in rows:
+        d = dict(row)
+        cat = d.pop("category_name")
+        d.pop("item_index")
+        if cat not in result:
+            result[cat] = []
+        result[cat].append(d)
+    return result
+
+
+def delete_semester(semester: str) -> int:
+    """Delete all scraped courses for a semester. Returns number of rows deleted."""
+    with get_db() as conn:
+        cur = conn.execute("DELETE FROM courses WHERE semester = ?", (semester,))
+        return cur.rowcount
+
+
+def list_scraped_semesters() -> list[dict]:
+    """Return all semesters in the courses table with their course counts."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT semester, COUNT(*) AS count FROM courses GROUP BY semester ORDER BY semester"
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_submission_stats() -> dict:

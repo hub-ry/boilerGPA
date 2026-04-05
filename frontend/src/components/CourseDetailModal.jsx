@@ -8,7 +8,7 @@
  * The chevron on the right of each category row toggles between modes.
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   DndContext,
@@ -24,7 +24,7 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { calcLocalGPA, effectiveScore, pctToLetter, SEMESTER_OPTIONS } from '../hooks/useDashboard';
+import { calcLocalGPA, effectiveScore, enteredAverage, pctToLetter, SEMESTER_OPTIONS } from '../hooks/useDashboard';
 
 const OVERLAY = {
   initial: { opacity: 0 },
@@ -38,6 +38,45 @@ const PANEL = {
 };
 
 const CAT_COLORS = ['bg-gold-500', 'bg-gold-300', 'bg-gold-700', 'bg-charcoal-400', 'bg-charcoal-300', 'bg-charcoal-500'];
+
+// ── NumericInput — allows fully clearing the field while typing ─────────────
+// Holds a local string draft; only commits the parsed value on blur/Enter.
+function NumericInput({ value, onChange, min, max, step, placeholder, className, title }) {
+  const [draft, setDraft] = useState(String(value ?? ''));
+
+  // Keep draft in sync when value is updated externally
+  useEffect(() => {
+    setDraft(String(value ?? ''));
+  }, [value]);
+
+  const commit = (raw) => {
+    const parsed = parseFloat(raw);
+    if (!isNaN(parsed)) {
+      const clamped = min !== undefined && parsed < min ? min
+                    : max !== undefined && parsed > max ? max
+                    : parsed;
+      onChange(clamped);
+      setDraft(String(clamped));
+    } else {
+      // Empty or invalid — revert to current value
+      setDraft(String(value ?? ''));
+    }
+  };
+
+  return (
+    <input
+      type="number"
+      min={min} max={max} step={step}
+      value={draft}
+      placeholder={placeholder}
+      title={title}
+      className={className}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={(e) => commit(e.target.value)}
+      onKeyDown={(e) => { if (e.key === 'Enter') { e.target.blur(); } }}
+    />
+  );
+}
 
 // ── Weight bar ─────────────────────────────────────────────────────────────
 
@@ -73,8 +112,9 @@ function AssignmentGrid({ category, catIdx, courseId, onUpdate }) {
 
   const filled = scores.map(parseFloat).filter((n) => !isNaN(n));
   const avg = filled.length > 0
-    ? (filled.reduce((a, b) => a + b, 0) / filled.length).toFixed(1)
+    ? (filled.reduce((a, b) => a + b, 0) / filled.length)
     : null;
+  const autoFill = avg !== null ? avg.toFixed(1) : null;
 
   return (
     <motion.div
@@ -86,28 +126,43 @@ function AssignmentGrid({ category, catIdx, courseId, onUpdate }) {
     >
       <div className="mt-3 pt-3 border-t border-white/[0.05]">
         <div className="grid grid-cols-4 sm:grid-cols-5 gap-1.5 mb-2">
-          {scores.map((s, idx) => (
-            <div key={idx} className="relative">
-              <input
-                type="number"
-                min="0"
-                max="100"
-                step="0.1"
-                value={s}
-                onChange={(e) => onUpdate(catIdx, idx, e.target.value)}
-                placeholder="—"
-                className="input-field w-full px-2 py-2 text-xs text-center"
-              />
-              <span className="absolute -top-1.5 left-1 text-charcoal-600 text-[9px] leading-none">
-                {idx + 1}
-              </span>
-            </div>
-          ))}
+          {scores.map((s, idx) => {
+            const isEmpty = s === '' || s === null || s === undefined;
+            const isAutoFilled = isEmpty && autoFill !== null;
+            return (
+              <div key={idx} className="relative">
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="0.1"
+                  value={s}
+                  onChange={(e) => onUpdate(catIdx, idx, e.target.value)}
+                  placeholder={autoFill ?? '—'}
+                  className={`input-field w-full px-2 py-2 text-xs text-center transition-opacity ${
+                    isAutoFilled ? 'placeholder-charcoal-500/60' : ''
+                  }`}
+                />
+                {/* Auto-fill ghost value */}
+                {isAutoFilled && (
+                  <span className="absolute inset-0 flex items-center justify-center text-xs text-charcoal-500/50 pointer-events-none select-none">
+                    {autoFill}
+                  </span>
+                )}
+                <span className="absolute -top-1.5 left-1 text-charcoal-600 text-[9px] leading-none">
+                  {idx + 1}
+                </span>
+              </div>
+            );
+          })}
         </div>
         {avg !== null && (
-          <p className="text-xs text-charcoal-400">
-            Average: <span className="text-white font-semibold">{avg}%</span>
-            <span className="text-charcoal-600 ml-2">({filled.length}/{count} entered)</span>
+          <p className="text-xs text-charcoal-400 flex items-center gap-1.5">
+            Average: <span className="text-white font-semibold">{avg.toFixed(1)}%</span>
+            <span className="text-charcoal-600">({filled.length}/{count} entered)</span>
+            {filled.length < count && (
+              <span className="text-charcoal-600/70 italic">· {count - filled.length} missing filled with avg</span>
+            )}
           </p>
         )}
       </div>
@@ -115,34 +170,61 @@ function AssignmentGrid({ category, catIdx, courseId, onUpdate }) {
   );
 }
 
-// ── Class stats panel ──────────────────────────────────────────────────────
+// ── Community stats panel ──────────────────────────────────────────────────
 
 const STATS_FIELDS = [
-  { key: 'min',    label: 'Min' },
-  { key: 'max',    label: 'Max' },
   { key: 'mean',   label: 'Mean' },
   { key: 'median', label: 'Median' },
-  { key: 'stdDev', label: 'Std Dev' },
+  { key: 'std_dev', label: 'Std Dev' },
+  { key: 'min_score', label: 'Min' },
+  { key: 'max_score', label: 'Max' },
 ];
 
-function ClassStatsPanel({ category, catIdx, onUpdate }) {
+// communityStats: array of {mean, median, std_dev, min_score, max_score, report_count} per item
+function CommunityStatsPanel({ category, courseCode, semester, communityStats, onRefresh }) {
   const count = category.count || 1;
-  // classStats is an array of length count; each entry is null or { min, max, mean, median, stdDev }
-  const statsArr = Array.isArray(category.classStats) && category.classStats.length === count
-    ? category.classStats
-    : Array(count).fill(null);
+  const base = (category.name || 'Item').replace(/s$/i, '').trim();
 
-  const setField = (itemIdx, key, val) => {
-    const parsed = val === '' ? null : parseFloat(val);
-    const next = statsArr.map((s, i) => {
-      if (i !== itemIdx) return s;
-      return { ...(s || {}), [key]: isNaN(parsed) ? null : parsed };
+  // reportForm: null | { itemIdx, values: {mean,median,std_dev,min_score,max_score} }
+  const [reportForm, setReportForm] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+
+  const openReport = (itemIdx) => {
+    setSubmitted(false);
+    setReportForm({
+      itemIdx,
+      values: { mean: '', median: '', std_dev: '', min_score: '', max_score: '' },
     });
-    onUpdate(catIdx, { classStats: next });
   };
 
-  // Label prefix: use category name, strip trailing 's' for singular (Exams → Exam)
-  const base = (category.name || 'Item').replace(/s$/i, '').trim();
+  const handleSubmit = async () => {
+    if (!reportForm) return;
+    setSubmitting(true);
+    try {
+      await fetch('http://localhost:8000/class-stats/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          course_code: courseCode,
+          semester: semester || '',
+          items: [{
+            category_name: category.name,
+            item_index: reportForm.itemIdx,
+            mean:      reportForm.values.mean      !== '' ? parseFloat(reportForm.values.mean)      : null,
+            median:    reportForm.values.median    !== '' ? parseFloat(reportForm.values.median)    : null,
+            std_dev:   reportForm.values.std_dev   !== '' ? parseFloat(reportForm.values.std_dev)   : null,
+            min_score: reportForm.values.min_score !== '' ? parseFloat(reportForm.values.min_score) : null,
+            max_score: reportForm.values.max_score !== '' ? parseFloat(reportForm.values.max_score) : null,
+          }],
+        }),
+      });
+      setSubmitted(true);
+      setReportForm(null);
+      onRefresh();
+    } catch { /* silent */ }
+    setSubmitting(false);
+  };
 
   return (
     <motion.div
@@ -153,42 +235,91 @@ function ClassStatsPanel({ category, catIdx, onUpdate }) {
       style={{ overflow: 'hidden' }}
     >
       <div className="px-3.5 pb-3.5 pt-2 border-t border-white/[0.05] space-y-3">
-        <p className="text-charcoal-600 text-xs">
-          Class statistics — paste from your professor's grade release
-        </p>
-
-        {/* Column headers */}
-        <div className="flex items-center gap-2">
-          <div className="w-16 shrink-0" />
-          <div className="grid grid-cols-5 gap-1.5 flex-1">
-            {STATS_FIELDS.map(({ label }) => (
-              <p key={label} className="text-charcoal-600 text-[10px] text-center">{label}</p>
-            ))}
-          </div>
+        <div className="flex items-center justify-between">
+          <p className="text-charcoal-600 text-xs">Community-reported class statistics</p>
+          {submitted && <span className="text-green-400 text-xs">✓ Reported!</span>}
         </div>
 
-        {statsArr.map((stats, itemIdx) => {
-          const s = stats || {};
-          const hasMean = s.mean != null;
+        {Array.from({ length: count }, (_, itemIdx) => {
+          const stats = communityStats?.[itemIdx];
+          const label = count === 1 ? category.name : `${base} ${itemIdx + 1}`;
+          const isReporting = reportForm?.itemIdx === itemIdx;
+
           return (
-            <div key={itemIdx} className="flex items-center gap-2">
-              <span className="text-charcoal-500 text-xs w-16 shrink-0 truncate">
-                {count === 1 ? category.name || 'Stats' : `${base} ${itemIdx + 1}`}
-              </span>
-              <div className="grid grid-cols-5 gap-1.5 flex-1">
-                {STATS_FIELDS.map(({ key }) => (
-                  <input
-                    key={key}
-                    type="number"
-                    min="0"
-                    step="0.1"
-                    value={s[key] ?? ''}
-                    onChange={(e) => setField(itemIdx, key, e.target.value)}
-                    placeholder="—"
-                    className="input-field w-full px-1 py-2 text-xs text-center"
-                  />
-                ))}
+            <div key={itemIdx} className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-charcoal-500 text-xs font-medium">{label}</span>
+                {!isReporting && (
+                  <button
+                    onClick={() => openReport(itemIdx)}
+                    className="text-[10px] text-gold-500/70 hover:text-gold-400 transition-colors"
+                  >
+                    + Report stats
+                  </button>
+                )}
               </div>
+
+              {/* Community stats display */}
+              {stats ? (
+                <div className="grid grid-cols-5 gap-1.5">
+                  {STATS_FIELDS.map(({ key, label: fieldLabel }) => (
+                    <div key={key} className="text-center">
+                      <p className="text-charcoal-700 text-[9px] mb-0.5">{fieldLabel}</p>
+                      <p className="text-charcoal-300 text-xs font-medium">
+                        {stats[key] != null ? stats[key].toFixed(1) : '—'}
+                      </p>
+                    </div>
+                  ))}
+                  <p className="col-span-5 text-charcoal-700 text-[9px] text-right">
+                    {stats.report_count} report{stats.report_count !== 1 ? 's' : ''}
+                  </p>
+                </div>
+              ) : (
+                <p className="text-charcoal-700 text-xs">No community stats yet — be the first to report!</p>
+              )}
+
+              {/* Report form */}
+              {isReporting && (
+                <motion.div
+                  initial={{ opacity: 0, y: -4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="space-y-2 p-2.5 rounded-lg bg-white/[0.03] border border-white/[0.06]"
+                >
+                  <div className="grid grid-cols-5 gap-1.5">
+                    {STATS_FIELDS.map(({ key, label: fieldLabel }) => (
+                      <div key={key}>
+                        <p className="text-charcoal-600 text-[9px] text-center mb-1">{fieldLabel}</p>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.1"
+                          value={reportForm.values[key]}
+                          onChange={(e) =>
+                            setReportForm((f) => ({ ...f, values: { ...f.values, [key]: e.target.value } }))
+                          }
+                          placeholder="—"
+                          className="input-field w-full px-1 py-1.5 text-xs text-center"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={handleSubmit}
+                      disabled={submitting}
+                      className="gold-btn flex-1 py-1.5 text-xs font-bold disabled:opacity-50"
+                    >
+                      {submitting ? 'Submitting…' : 'Submit Report'}
+                    </button>
+                    <button
+                      onClick={() => setReportForm(null)}
+                      className="px-3 py-1.5 rounded-lg text-xs text-charcoal-500 hover:text-white bg-white/[0.04] transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </motion.div>
+              )}
             </div>
           );
         })}
@@ -199,13 +330,12 @@ function ClassStatsPanel({ category, catIdx, onUpdate }) {
 
 // ── Single category row ────────────────────────────────────────────────────
 
-function CategoryRow({ category, catIdx, course, onUpdate, onUpdateAssignment, onToggleMode, onRemove, colorClass, isOnly, dragHandleProps }) {
+function CategoryRow({ category, catIdx, course, onUpdate, onUpdateAssignment, onToggleMode, onRemove, colorClass, isOnly, dragHandleProps, communityStats, onRefreshStats }) {
   const [showStats, setShowStats] = useState(false);
+  const hasStats = Array.isArray(communityStats) && communityStats.length > 0;
   const score = effectiveScore(category);
   const isExpanded = category.entryMode === 'individual';
   const canExpand = (category.count || 1) > 1;
-  const hasStats = Array.isArray(category.classStats) &&
-    category.classStats.some((s) => s && Object.values(s).some((v) => v != null));
 
   return (
     <div className={`rounded-xl border transition-all duration-200 ${
@@ -242,22 +372,20 @@ function CategoryRow({ category, catIdx, course, onUpdate, onUpdateAssignment, o
             className="input-field flex-1 min-w-0 px-2 py-1.5 text-sm font-medium"
           />
           <div className="relative shrink-0">
-            <input
-              type="number"
-              min="0" max="100" step="1"
+            <NumericInput
+              min={0} max={100} step={1}
               value={category.weight}
-              onChange={(e) => onUpdate(catIdx, { weight: parseFloat(e.target.value) || 0 })}
+              onChange={(v) => onUpdate(catIdx, { weight: v })}
               placeholder="0"
               className="input-field w-14 px-2 py-1.5 text-xs text-center"
             />
             <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-charcoal-600 text-[10px] pointer-events-none">%</span>
           </div>
           <div className="relative shrink-0">
-            <input
-              type="number"
-              min="1" max="100" step="1"
+            <NumericInput
+              min={1} max={100} step={1}
               value={category.count}
-              onChange={(e) => onUpdate(catIdx, { count: parseInt(e.target.value) || 1 })}
+              onChange={(v) => onUpdate(catIdx, { count: Math.round(v) })}
               title="Number of items"
               className="input-field w-12 px-1.5 py-1.5 text-xs text-center"
             />
@@ -374,13 +502,15 @@ function CategoryRow({ category, catIdx, course, onUpdate, onUpdateAssignment, o
         )}
       </AnimatePresence>
 
-      {/* Class stats panel */}
+      {/* Community stats panel */}
       <AnimatePresence>
         {showStats && (
-          <ClassStatsPanel
+          <CommunityStatsPanel
             category={category}
-            catIdx={catIdx}
-            onUpdate={onUpdate}
+            courseCode={course.course_code}
+            semester={course.semester || ''}
+            communityStats={communityStats}
+            onRefresh={onRefreshStats}
           />
         )}
       </AnimatePresence>
@@ -421,9 +551,23 @@ export default function CourseDetailModal({
   onRemoveCategory,
   onRemoveCourse,
   onReorderCategories,
+  activeSemester,
 }) {
   const [showDelete, setShowDelete] = useState(false);
   const [editingHeader, setEditingHeader] = useState(false);
+  const [shareStatus, setShareStatus] = useState(null); // null | 'sharing' | 'done' | 'error'
+  const [allCommunityStats, setAllCommunityStats] = useState({});
+
+  const fetchCommunityStats = useCallback(async () => {
+    if (!course.course_code) return;
+    try {
+      const resp = await fetch(`http://localhost:8000/class-stats/${course.course_code}`);
+      const json = await resp.json();
+      if (json.stats) setAllCommunityStats(json.stats);
+    } catch { /* silent */ }
+  }, [course.course_code]);
+
+  useEffect(() => { fetchCommunityStats(); }, [fetchCommunityStats]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -490,11 +634,10 @@ export default function CourseDetailModal({
                     className="input-field px-3 py-2 text-xs"
                     placeholder="Instructor"
                   />
-                  <input
-                    type="number"
-                    min="1" max="6"
+                  <NumericInput
+                    min={1} max={6} step={1}
                     value={course.credit_hours}
-                    onChange={(e) => onUpdate({ credit_hours: parseInt(e.target.value) || 3 })}
+                    onChange={(v) => onUpdate({ credit_hours: Math.round(v) })}
                     className="input-field px-3 py-2 text-xs text-center"
                     placeholder="Credits"
                   />
@@ -595,6 +738,8 @@ export default function CourseDetailModal({
                       onUpdateAssignment={onUpdateAssignment}
                       onToggleMode={onToggleEntryMode}
                       onRemove={onRemoveCategory}
+                      communityStats={allCommunityStats[cat.name] || []}
+                      onRefreshStats={fetchCommunityStats}
                     />
                   ))}
                 </div>
@@ -618,17 +763,63 @@ export default function CourseDetailModal({
                 <div key={g}>
                   <label className="text-charcoal-500 text-xs block mb-1 text-center">{g}</label>
                   <div className="relative">
-                    <input
-                      type="number"
-                      min="0" max="100"
+                    <NumericInput
+                      min={0} max={100} step={1}
                       value={scale[g]}
-                      onChange={(e) => onUpdate({ grading_scale: { ...course.grading_scale, [g]: parseFloat(e.target.value) || 0 } })}
+                      onChange={(v) => onUpdate({ grading_scale: { ...course.grading_scale, [g]: v } })}
                       className="input-field w-full px-2 py-2 text-sm text-center"
                     />
                     <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-charcoal-600 text-[10px] pointer-events-none">%</span>
                   </div>
                 </div>
               ))}
+            </div>
+          </div>
+
+          {/* Share scaffold string */}
+          <div className="pt-2 border-t border-white/[0.04]">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-charcoal-400 text-sm font-medium">Share grading structure</p>
+                <p className="text-charcoal-600 text-xs mt-0.5">Copies a string others can paste in "Add Course"</p>
+              </div>
+              <button
+                disabled={shareStatus === 'done'}
+                onClick={() => {
+                  try {
+                    const scaffold = {
+                      course_code: course.course_code || '',
+                      course_name: course.course_name || '',
+                      instructor: course.instructor || '',
+                      credit_hours: course.credit_hours || 3,
+                      grading_scale: course.grading_scale || { A: 90, B: 80, C: 70, D: 60 },
+                      categories: course.categories.map((c) => ({
+                        name: c.name, weight: c.weight, count: c.count ?? 1,
+                      })),
+                    };
+                    const str = 'bgpa_course_v1_' + btoa(encodeURIComponent(JSON.stringify(scaffold)));
+                    navigator.clipboard.writeText(str).catch(() => {
+                      const el = document.createElement('textarea');
+                      el.value = str;
+                      document.body.appendChild(el);
+                      el.select();
+                      document.execCommand('copy');
+                      document.body.removeChild(el);
+                    });
+                    setShareStatus('done');
+                    setTimeout(() => setShareStatus(null), 2500);
+                  } catch { setShareStatus('error'); setTimeout(() => setShareStatus(null), 2000); }
+                }}
+                className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-all ${
+                  shareStatus === 'done'
+                    ? 'bg-green-500/15 text-green-400 border border-green-500/20'
+                    : shareStatus === 'error'
+                    ? 'bg-red-500/15 text-red-400 border border-red-500/20'
+                    : 'bg-gold-500/10 text-gold-400 border border-gold-500/20 hover:bg-gold-500/20'
+                }`}
+              >
+                {shareStatus === 'done' ? '✓ Copied!' : shareStatus === 'error' ? 'Failed' : 'Copy String'}
+              </button>
             </div>
           </div>
 

@@ -9,6 +9,41 @@ import { useDashboard, calcLocalGPA, calcSemesterGPA, calcCumulativeGPA, SEMESTE
 import CourseCard from './CourseCard';
 import AddCourseModal from './AddCourseModal';
 import CourseDetailModal from './CourseDetailModal';
+import ExportImportModal from './ExportImportModal';
+
+function CurvedGPADisplay({ predictedGPA }) {
+  return (
+    <div>
+      <span className="text-charcoal-400 text-xs block">w/ curve</span>
+      <p className="text-2xl font-black text-gold-500 leading-none">
+        {predictedGPA.toFixed(2)}
+        <span className="text-gold-500/50 text-sm ml-0.5">↑</span>
+      </p>
+    </div>
+  );
+}
+
+function GPAPill({ semGPA, predictedResult }) {
+  const predGPA = predictedResult?.predicted_gpa;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, scale: 0.9 }}
+      animate={{ opacity: 1, scale: 1 }}
+      className="hidden sm:flex items-center gap-3 px-4 py-1.5 rounded-full glass-card text-sm"
+    >
+      <span className="text-charcoal-400">GPA</span>
+      <span className="text-white font-bold">{semGPA.toFixed(2)}</span>
+      {predGPA != null && (
+        <>
+          <span className="text-charcoal-700">|</span>
+          <span className="text-gold-500 font-bold">{predGPA.toFixed(2)}</span>
+          <span className="text-gold-500/50 text-xs">curved</span>
+        </>
+      )}
+    </motion.div>
+  );
+}
 
 function CumulativeGPACard({ priorQP, priorHours, onChangeQP, onChangeHours, semGPA, cumulativeGPA }) {
   const [open, setOpen] = useState(false);
@@ -129,9 +164,12 @@ export default function Dashboard() {
     parseSyllabus, searchCourses, fetchTemplate,
     priorQP, setPriorQP, priorHours, setPriorHours,
     isLoading, error, setError,
+    predictedResult,
+    exportData, importData,
   } = dash;
 
   const [showAddCourse, setShowAddCourse] = useState(false);
+  const [showExportImport, setShowExportImport] = useState(false);
   const [showAddSemester, setShowAddSemester] = useState(false);
   const [newSemInput, setNewSemInput] = useState('');
   const [detailCourseId, setDetailCourseId] = useState(null);
@@ -151,14 +189,6 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-charcoal-950">
-      {/* Gold glow */}
-      <div
-        className="fixed inset-0 pointer-events-none"
-        style={{
-          background:
-            'radial-gradient(ellipse 80% 40% at 50% -10%, rgba(207,185,145,0.06) 0%, transparent 70%)',
-        }}
-      />
 
       <div className="relative z-10 max-w-5xl mx-auto px-4 pt-8 pb-16">
 
@@ -171,17 +201,22 @@ export default function Dashboard() {
             <span className="text-gold-500 font-bold text-lg tracking-tight">BoilerGPA</span>
           </div>
 
-          {/* GPA pill */}
-          {semGPA !== null && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.9 }}
-              animate={{ opacity: 1, scale: 1 }}
-              className="hidden sm:flex items-center gap-2 px-4 py-1.5 rounded-full glass-card text-sm"
+          <div className="flex items-center gap-2">
+            {/* GPA pill */}
+            {semGPA !== null && (
+              <GPAPill semGPA={semGPA} predictedResult={predictedResult} />
+            )}
+            {/* Export / Import */}
+            <button
+              onClick={() => setShowExportImport(true)}
+              title="Export / Import data"
+              className="glass-card p-2 rounded-xl text-charcoal-500 hover:text-white transition-colors"
             >
-              <span className="text-charcoal-400">Semester GPA</span>
-              <span className="text-white font-bold">{semGPA.toFixed(2)}</span>
-            </motion.div>
-          )}
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+              </svg>
+            </button>
+          </div>
         </div>
 
         {/* ── Semester tabs ── */}
@@ -254,7 +289,12 @@ export default function Dashboard() {
             className="sm:hidden glass-card px-4 py-3 mb-4 flex items-center justify-between"
           >
             <span className="text-charcoal-400 text-sm">Semester GPA</span>
-            <span className="text-white font-bold text-lg">{semGPA.toFixed(2)}</span>
+            <div className="flex items-center gap-3">
+              <span className="text-white font-bold text-lg">{semGPA.toFixed(2)}</span>
+              {predictedResult?.predicted_gpa != null && (
+                <span className="text-gold-500 font-bold text-lg">{predictedResult.predicted_gpa.toFixed(2)}</span>
+              )}
+            </div>
           </motion.div>
         )}
 
@@ -299,12 +339,14 @@ export default function Dashboard() {
               <AnimatePresence mode="popLayout">
                 {courses.map((course, i) => {
                   const gradeInfo = calcLocalGPA(course);
+                  const prediction = predictedResult?.courses?.[i] ?? null;
                   return (
                     <CourseCard
                       key={course.id}
                       course={course}
                       gradeInfo={gradeInfo}
                       index={i}
+                      prediction={prediction}
                       onClick={() => setDetailCourseId(course.id)}
                     />
                   );
@@ -342,16 +384,25 @@ export default function Dashboard() {
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="text-white font-semibold">{activeSemester} Summary</h3>
                   {semGPA !== null && (
-                    <div className="text-right">
-                      <span className="text-charcoal-400 text-xs">GPA</span>
-                      <p className="text-2xl font-black text-white leading-none">{semGPA.toFixed(2)}</p>
+                    <div className="text-right flex items-end gap-4">
+                      <div>
+                        <span className="text-charcoal-400 text-xs block">Raw GPA</span>
+                        <p className="text-2xl font-black text-white leading-none">{semGPA.toFixed(2)}</p>
+                      </div>
+                      {predictedResult?.predicted_gpa != null && (
+                        <CurvedGPADisplay
+                          predictedGPA={predictedResult.predicted_gpa}
+                        />
+                      )}
                     </div>
                   )}
                 </div>
 
                 <div className="space-y-2">
-                  {courses.map((course) => {
+                  {courses.map((course, i) => {
                     const { letter, weightedScore } = calcLocalGPA(course);
+                    const pred = predictedResult?.courses?.[i];
+                    const hasCurve = pred?.curve_applied > 0;
                     return (
                       <div key={course.id} className="flex items-center justify-between py-2 border-b border-white/[0.04] last:border-0">
                         <div className="flex items-center gap-3">
@@ -360,13 +411,21 @@ export default function Dashboard() {
                               {course.course_code}
                             </span>
                           )}
-                          <span className="text-charcoal-300 text-sm truncate max-w-[200px]">{course.course_name}</span>
+                          <span className="text-charcoal-300 text-sm truncate max-w-[160px]">{course.course_name}</span>
                         </div>
                         <div className="flex items-center gap-3 shrink-0">
                           {weightedScore !== null && (
                             <span className="text-charcoal-500 text-xs">{weightedScore}%</span>
                           )}
                           <span className={`font-bold text-sm ${LETTER_COLOR(letter)}`}>{letter}</span>
+                          {hasCurve && (
+                            <div className="flex items-center gap-1">
+                              <svg className="w-3 h-3 text-gold-500/50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                              </svg>
+                              <span className="font-bold text-sm text-gold-400">{pred.predicted_letter}</span>
+                            </div>
+                          )}
                         </div>
                       </div>
                     );
@@ -396,12 +455,25 @@ export default function Dashboard() {
 
       {/* ── Modals ── */}
       <AnimatePresence>
+        {showExportImport && (
+          <ExportImportModal
+            onClose={() => setShowExportImport(false)}
+            exportData={exportData}
+            importData={importData}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
         {showAddCourse && (
           <AddCourseModal
             onClose={() => { setShowAddCourse(false); setError(null); }}
             onSave={(courseData) => {
               addCourse(courseData);
               setShowAddCourse(false);
+            }}
+            onSaveBulk={(coursesData) => {
+              coursesData.forEach(addCourse);
             }}
             parseSyllabus={parseSyllabus}
             searchCourses={searchCourses}
@@ -426,6 +498,7 @@ export default function Dashboard() {
             onRemoveCategory={(catIdx) => removeCategory(detailCourse.id, catIdx)}
             onReorderCategories={(oldIdx, newIdx) => reorderCategories(detailCourse.id, oldIdx, newIdx)}
             onRemoveCourse={() => { removeCourse(detailCourse.id); setDetailCourseId(null); }}
+            activeSemester={activeSemester}
           />
         )}
       </AnimatePresence>

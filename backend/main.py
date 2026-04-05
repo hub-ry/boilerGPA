@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 import db as database
 from calculator import calculate_overall_gpa, what_score_needed
-from parser import parse_syllabus_pdf
+from parser import parse_syllabus_pdf, safe_parse_syllabus_pdf
 from predictor import predict_overall_gpa
 
 # ---------------------------------------------------------------------------
@@ -126,6 +126,43 @@ class GradeSubmissionRequest(BaseModel):
     entries: list[GradeSubmissionEntry]
 
 
+class ExplainCurveRequest(BaseModel):
+    course_name: str
+    course_code: str = ""
+    current_score: float
+    current_letter: str
+    predicted_score: float
+    predicted_letter: str
+    curve_applied: float
+    confidence: str
+    data_source: str  # "class_stats" | "historical" | "none"
+
+
+class CommunityTemplateSubmit(BaseModel):
+    course_code: str
+    course_name: str = ""
+    semester: str = ""
+    instructor: str = ""
+    categories: list[dict]
+    credit_hours: int = 3
+    grading_scale: dict = Field(default_factory=lambda: {"A": 90, "B": 80, "C": 70, "D": 60})
+
+
+class ClassStatsItem(BaseModel):
+    category_name: str
+    item_index: int = 0
+    mean: Optional[float] = None
+    median: Optional[float] = None
+    std_dev: Optional[float] = None
+    min_score: Optional[float] = None
+    max_score: Optional[float] = None
+
+class ClassStatsReport(BaseModel):
+    course_code: str
+    semester: str = ""
+    items: list[ClassStatsItem]
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -155,10 +192,10 @@ async def parse_syllabus(file: UploadFile = File(...)):
     if len(pdf_bytes) > 20 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="PDF file too large (max 20MB)")
 
-    try:
-        result = await parse_syllabus_pdf(pdf_bytes)
+    result, is_partial = await safe_parse_syllabus_pdf(pdf_bytes)
 
-        # Save structural info as a canonical template for this course
+    # Save structural info as a canonical template for this course (only when fully parsed)
+    if not is_partial:
         course_code = result.get("course_code", "")
         code_match = re.match(r"^([A-Za-z]+)(\d+)", course_code.strip())
         if code_match and result.get("categories"):
@@ -179,17 +216,7 @@ async def parse_syllabus(file: UploadFile = File(...)):
             except Exception:
                 logger.warning("Failed to save course template", exc_info=True)
 
-        return {"success": True, "data": result}
-    except EnvironmentError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Could not parse syllabus: {str(e)}. Try entering your course manually.",
-        )
-    except Exception:
-        logger.exception("Unexpected error parsing syllabus")
-        raise HTTPException(status_code=500, detail="Unexpected error parsing PDF")
+    return {"success": True, "data": result, "partial": is_partial}
 
 
 @app.post("/calculate-gpa")
@@ -215,6 +242,21 @@ async def predict_gpa(request: GPARequest):
     courses_data = [course.model_dump() for course in request.courses]
     result = await predict_overall_gpa(courses_data)
     return {"success": True, "data": result}
+
+
+@app.get("/courses/semesters")
+async def list_semesters():
+    """List all scraped semesters and their course counts."""
+    return {"success": True, "data": database.list_scraped_semesters()}
+
+
+@app.delete("/courses/semester/{semester}")
+async def delete_semester(semester: str):
+    """Delete all scraped courses for a semester (e.g. 'Spring 2026')."""
+    deleted = database.delete_semester(semester)
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail=f"No courses found for semester '{semester}'")
+    return {"success": True, "deleted": deleted, "semester": semester}
 
 
 @app.get("/courses/search")
@@ -351,3 +393,128 @@ async def what_score_needed_endpoint(request: FinalScoreNeededRequest):
             "scores_needed": results,
         },
     }
+
+
+@app.post("/explain-curve")
+async def explain_curve(request: ExplainCurveRequest):
+    """
+    Generate a concise, student-facing AI explanation for the curve prediction.
+    Uses Claude Haiku — fast and cheap (< $0.001 per call).
+    """
+    import anthropic as _anthropic
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
+
+    source_context = {
+        "class_stats": "professor-released class statistics (mean/std dev entered by the student)",
+        "historical": "historical grade submissions from past students of this course",
+        "none": "no historical data — only the student's raw score is available",
+    }.get(request.data_source, "available data")
+
+    no_curve = request.curve_applied == 0
+
+    prompt = f"""You are explaining a GPA curve prediction to a college student.
+
+Course: {request.course_name or request.course_code}
+Student's current score: {request.current_score:.1f}%
+Current letter grade (raw): {request.current_letter}
+Predicted score after curve: {request.predicted_score:.1f}%
+Predicted letter grade: {request.predicted_letter}
+Curve applied: {request.curve_applied} points
+Data source: {source_context}
+Confidence: {request.confidence}
+
+Write 2-3 sentences directly to the student explaining {"why no curve is expected" if no_curve else f"why their {request.current_score:.1f}% is predicted to be curved to a {request.predicted_letter}"}. Be specific about the numbers. Be honest about uncertainty if confidence is low or medium. Don't use bullet points. Don't start with "I"."""
+
+    client = _anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=150,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    explanation = response.content[0].text.strip()
+
+    return {"success": True, "explanation": explanation}
+
+
+# ---------------------------------------------------------------------------
+# Community templates
+# ---------------------------------------------------------------------------
+
+@app.post("/community/submit")
+async def submit_community_template(req: CommunityTemplateSubmit):
+    """Publish a grading structure (no scores) to the community DB."""
+    m = re.match(r"^([A-Za-z]+)(\d+)", req.course_code.strip())
+    if not m:
+        raise HTTPException(status_code=400, detail="Invalid course code")
+    subject, number = m.group(1).upper(), m.group(2)
+
+    # Strip everything except structural fields — never store scores
+    clean_cats = [
+        {"name": c.get("name", ""), "weight": c.get("weight", 0), "count": c.get("count", 1)}
+        for c in req.categories
+        if c.get("name", "").strip()
+    ]
+    if not clean_cats:
+        raise HTTPException(status_code=400, detail="No valid categories")
+
+    template_id = database.submit_community_template(
+        subject=subject,
+        number=number,
+        course_name=req.course_name,
+        semester=req.semester,
+        instructor=req.instructor,
+        categories=clean_cats,
+        credit_hours=req.credit_hours,
+        grading_scale=req.grading_scale,
+    )
+    return {"success": True, "template_id": template_id}
+
+
+@app.get("/community/templates/{course_code}")
+async def get_community_templates(course_code: str):
+    """Return all community templates for a course code, sorted by stars."""
+    m = re.match(r"^([A-Za-z]+)(\d+)", course_code.strip())
+    if not m:
+        return {"success": True, "templates": []}
+    subject, number = m.group(1).upper(), m.group(2)
+    templates = database.get_community_templates(subject, number)
+    return {"success": True, "templates": templates}
+
+
+@app.post("/community/star/{template_id}")
+async def star_community_template(template_id: int):
+    """Upvote a community template."""
+    stars = database.star_community_template(template_id)
+    if stars is None:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return {"success": True, "stars": stars}
+
+
+@app.post("/class-stats/report")
+async def report_class_stats(req: ClassStatsReport):
+    """Submit crowd-sourced class statistics for a course."""
+    if not req.course_code.strip():
+        raise HTTPException(status_code=400, detail="course_code required")
+    for item in req.items:
+        database.report_class_stats(
+            course_code=req.course_code,
+            category_name=item.category_name,
+            item_index=item.item_index,
+            semester=req.semester,
+            mean=item.mean,
+            median=item.median,
+            std_dev=item.std_dev,
+            min_score=item.min_score,
+            max_score=item.max_score,
+        )
+    return {"success": True}
+
+
+@app.get("/class-stats/{course_code}")
+async def get_class_stats(course_code: str, semester: str = ""):
+    """Return aggregated community class stats for a course."""
+    stats = database.get_class_stats_for_course(course_code.strip(), semester)
+    return {"success": True, "stats": stats}

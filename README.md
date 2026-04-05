@@ -1,67 +1,77 @@
 # BoilerGPA
 
-**Know exactly where you stand.**
+GPA helper for Purdue students: upload a syllabus PDF (or add a course by search), enter how you’re doing, and see a weighted GPA plus a **rough** guess at how grading might shake out if the class curves like it has in the past.
 
-A GPA calculator and curve predictor built for Purdue students. Upload your syllabus PDF, enter your scores, and BoilerGPA tells you your current GPA — plus what it's likely to be after the curve.
-
----
-
-## What it actually does
-
-Most grade calculators just do weighted math. BoilerGPA does three things on top of that:
-
-1. **Reads your syllabus for you.** Drop in the PDF, and Claude (Haiku) extracts the grading categories, their weights, assignment counts, drop policies, and the grading scale — no manual entry required.
-
-2. **Predicts your final grade with curve data.** It cross-references your score against historical grade distributions from [BoilerGrades](https://boilergrades.com) (public records data, MIT licensed). If the class historically averages a 72%, it estimates the curve and bumps your predicted grade accordingly.
-
-3. **Answers "what do I need on the final?"** Given how much of the course is left, it solves backwards to tell you the exact score required to land each letter grade.
+Nothing here is academic or legal advice — it’s a tool built for a hackathon. Treat predictions as conversation starters, not guarantees.
 
 ---
 
-## How the stack fits together
+## What actually works today
 
-```
-Browser (React 18)
-  │
-  │  POST /parse-syllabus  (multipart PDF)
-  │  POST /calculate-gpa   (JSON scores)
-  │  POST /predict-gpa     (JSON scores)
-  │  GET  /courses/search  (search query)
-  ▼
-FastAPI (Python 3.13)
-  ├── parser.py       — PyMuPDF extracts text/tables → Claude Haiku → structured JSON
-  ├── calculator.py   — Weighted GPA math, letter grade conversion
-  ├── predictor.py    — Curve inference from class stats or historical data
-  └── db.py           — SQLite: course catalog + anonymous grade submissions
-```
+- **Syllabus PDF upload** — The backend pulls text (and some table/layout hints) with PyMuPDF, then asks **Claude Haiku** to return structured categories, weights, and an optional grading scale. Messy syllabi, weird layouts, or scanned/image-only PDFs can still come back wrong or fall back to a generic template; you can edit everything by hand afterward.
+- **Manual courses** — Search pulls from your **local** scraped catalog when you’ve run the scraper; otherwise it hits **Purdue’s public OData API** (`api.purdue.io`) when possible.
+- **Weighted GPA** — Categories are treated as percentages of the course grade; the server computes current GPA-style numbers from what you entered.
+- **“What do I need on the final?”** — On the results screen there’s a small calculator. Right now it uses **fixed cutoffs (90 / 80 / 70 / 60)** in the browser. The backend also exposes `/what-score-needed`, which **can** use your syllabus grading scale, but the main UI doesn’t call that yet.
+- **Curve-style prediction** — Uses a simple heuristic (if the estimated class average sits below the “B” line on *your* scale, it applies a partial bump). Data priority in code is roughly: **stats you enter** → **community-reported class stats** (σ / reporting flow) → **anonymous letter-grade submissions** from other users (when there are enough) → **imported BoilerGrades distributions** → otherwise it admits **low confidence** and mostly shows your raw score.
+- **Optional AI blurb** — “Explain this curve” calls **Claude** again; needs `ANTHROPIC_API_KEY`.
+- **Community templates** — When you search by course code, you can see star-ranked structures other people submitted; starring hits the API.
+- **Dashboard flow** (separate from the main GPA wizard) can **submit anonymous final letter grades** to grow the crowd dataset.
 
-The frontend never calls Claude directly. All AI calls go through the backend so the API key stays server-side.
+If the API key is missing, syllabus parsing won’t work (the safe path returns a partial/default layout). The health endpoint and a lot of the math still run.
+
+---
+
+## Honest limitations
+
+- **Predictions are not verified against real curves** — They’re heuristics plus whatever data happened to be in the database.
+- **Historical data has gaps** — BoilerGrades coverage is whatever’s in the upstream CSVs; instructor matching is last-name based and imperfect.
+- **BoilerGrades data does not load by itself** — Starting the server creates/opens SQLite tables; to fill **`historical_grade_stats`** from the public [boiler-grades](https://github.com/eduxstad/boiler-grades) repo, run:
+
+  ```bash
+  cd backend && source .venv/bin/activate   # or activate.fish on fish
+  python import_boilergrades.py
+  ```
+
+  That project is **GPL v3**; we’re just importing aggregated distributions (no per-student rows).
+
+- **One frontend bug to know if you deploy** — Class-stat reporting in `CourseDetailModal` still posts to a hardcoded `http://localhost:8000` URL in places; the rest of the app uses `REACT_APP_API_BASE`. Fix that before pointing the UI at a remote API.
+
+---
+
+## Stack (straight version)
+
+- **Frontend:** React 18, talks to the backend over HTTP (`REACT_APP_API_BASE`, default `http://localhost:8000`).
+- **Backend:** FastAPI, SQLite (`backend/data/boilergpa.db`), Anthropic for syllabus parse + curve explanation.
+
+The browser never holds your Anthropic key; only the server does.
 
 ---
 
 ## Setup
 
-### Prerequisites
-
-- Python 3.11+
-- Node.js 18+
-- An [Anthropic API key](https://console.anthropic.com)
+**You’ll need:** Python 3.11+, Node 18+, and an [Anthropic API key](https://console.anthropic.com) for full functionality.
 
 ### Backend
 
 ```bash
 cd backend
 python3 -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+# fish: source .venv/bin/activate.fish
 
-# Create your .env file
+pip install -r requirements.txt
 echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
 
 uvicorn main:app --reload --port 8000
 ```
 
-The server starts at `http://localhost:8000`. On first boot it creates `backend/data/boilergpa.db` and imports the BoilerGrades CSV into SQLite.
+Server: `http://localhost:8000`
+
+Optional but recommended for curve data:
+
+```bash
+python import_boilergrades.py
+```
 
 ### Frontend
 
@@ -69,12 +79,11 @@ The server starts at `http://localhost:8000`. On first boot it creates `backend/
 cd frontend
 npm install
 npm start
-# Opens at http://localhost:3000
 ```
 
-### (Optional) Scrape the Purdue course catalog
+App: `http://localhost:3000`
 
-The course search falls back to Purdue's live OData API if the local DB is empty, so this step isn't required. But if you want fast offline search:
+### Optional: scrape the catalog for faster search
 
 ```bash
 cd backend
@@ -82,115 +91,57 @@ source .venv/bin/activate
 python scraper.py -sem "Spring 2026"
 ```
 
-This uses Selenium + ChromeDriver to pull course data from MyPurdue. `webdriver-manager` handles the driver install automatically.
-
----
-
-## How syllabus parsing works
-
-When a PDF is uploaded:
-
-1. **PyMuPDF** extracts raw text and converts any tables to Markdown. It also does a second spatial pass to find `\d+%` tokens and their surrounding words — this catches grading info inside pie charts or scattered visual layouts.
-
-2. The text is trimmed to the grading-relevant section only (anchored by headers like "Assessment Weights" or the last `%` sign in the document), keeping costs low.
-
-3. The trimmed text is sent to **Claude Haiku** with a strict system prompt that demands a specific JSON schema: category names, weights (must sum to 1.0), counts, drop policies, and the grading scale.
-
-4. If the JSON is invalid or weights don't sum, the backend retries once with a repair prompt before giving up.
-
-5. The normalized result is saved as a community template so future users of the same course get it pre-filled.
-
----
-
-## How curve prediction works
-
-For each course, the predictor tries three data sources in order:
-
-| Priority | Source | Confidence |
-|---|---|---|
-| 1 | Class stats entered by the student (professor releases mean/std dev) | High |
-| 2 | Crowd-reported stats from other users this semester | High |
-| 3 | Historical grade distributions from BoilerGrades CSV | Medium/Low |
-| 4 | Nothing — raw score only | Low |
-
-The curve logic: if the class mean is below the B threshold (default 80%), the predictor estimates a partial correction. It uses smaller multipliers for historical data (more uncertainty) and larger ones for current-semester stats (professor actually released numbers).
-
----
-
-## API reference
-
-| Method | Endpoint | What it does |
-|---|---|---|
-| `POST` | `/parse-syllabus` | Upload a PDF → returns grading categories + weights |
-| `POST` | `/calculate-gpa` | Compute current GPA from entered scores |
-| `POST` | `/predict-gpa` | Predict final GPA with curve estimation |
-| `GET` | `/courses/search?q=cs251` | Search Purdue course catalog (local DB → Purdue API fallback) |
-| `POST` | `/what-score-needed` | What score is needed on a final to hit each letter grade |
-| `POST` | `/explain-curve` | Claude Haiku writes a 2-3 sentence explanation of a prediction |
-| `POST` | `/submit-grades` | Anonymously submit your final letter grades to improve predictions |
-| `GET` | `/community/templates/{course_code}` | Get community-submitted grading structures for a course |
-| `POST` | `/class-stats/report` | Report class statistics (mean, std dev) for a course |
-| `GET` | `/health` | Returns DB stats |
+Uses Selenium + Chrome; `webdriver-manager` grabs a driver. Skip this if you’re fine with the Purdue API fallback (slower, needs network).
 
 ---
 
 ## Environment variables
 
 **Backend** (`backend/.env`):
-```
+
+```text
 ANTHROPIC_API_KEY=sk-ant-...
-ALLOWED_ORIGINS=http://localhost:3000,https://your-deployed-frontend.com
+ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 ```
 
-**Frontend** (`.env` or `frontend/.env.local`):
-```
+`ALLOWED_ORIGINS` is comma-separated. Defaults are localhost-friendly.
+
+**Frontend** (`frontend/.env.local` or `.env`):
+
+```text
 REACT_APP_API_BASE=http://localhost:8000
 ```
 
-`ANTHROPIC_API_KEY` is the only required variable. `ALLOWED_ORIGINS` defaults to `localhost:3000` and `REACT_APP_API_BASE` defaults to `localhost:8000`, so local dev works with zero config.
+---
+
+## API (what’s implemented)
+
+| Method | Path | Notes |
+|--------|------|--------|
+| `GET` | `/health` | DB-ish stats |
+| `POST` | `/parse-syllabus` | PDF upload; rate limited |
+| `POST` | `/calculate-gpa` | Body: `{ "courses": [...] }` |
+| `POST` | `/predict-gpa` | Same shape; returns per-course predictions |
+| `POST` | `/what-score-needed` | Uses request `grading_scale` |
+| `POST` | `/explain-curve` | Claude; rate limited; needs API key |
+| `GET` | `/courses/search?q=` | Local DB first, then Purdue OData |
+| `GET` | `/courses/semesters` | Scraped semesters |
+| `DELETE` | `/courses/semester/{semester}` | Wipe one scraped term |
+| `GET` | `/courses/{subject}/{number}/template` | Canonical template from prior parses |
+| `POST` | `/submit-grades` | Anonymous letter grades; rate limited |
+| `POST` | `/community/submit` | Publish a structure (no scores) |
+| `GET` | `/community/templates/{course_code}` | e.g. `CS25200` |
+| `POST` | `/community/star/{template_id}` | Rate limited |
+| `POST` | `/class-stats/report` | Crowd class stats |
+| `GET` | `/class-stats/{course_code}` | Aggregated stats |
+
+Interactive docs: `http://localhost:8000/docs` when the server is running.
 
 ---
 
-## Data sources
+## How syllabus parsing roughly works
 
-- **BoilerGrades** — Grade distribution data from a Purdue public records request. MIT licensed, FERPA compliant (no individual student data). Stored in `backend/data/boilergrades.csv`.
-- **Purdue OData API** — `https://api.purdue.io/odata/` — public course catalog used as a live fallback when the local DB hasn't been scraped yet.
-
----
-
----
-
-## Problems I had to fix
-
-These are real bugs found and patched after the initial build. Documenting them here because they're the kind of thing that silently breaks a project mid-demo.
-
-### `explain-curve` was blocking the entire server
-
-`/explain-curve` used the synchronous `anthropic.Anthropic` client inside an `async` FastAPI handler — no `await`, no thread pool. Every request froze the event loop for the duration of the Claude call (~1-2 seconds). Under concurrent load (multiple browser tabs, anyone hitting the API), all other requests would queue behind it. Fixed by wrapping the sync call in `asyncio.to_thread()`.
-
-### `what-score-needed` ignored your professor's grading scale
-
-The endpoint hardcoded `{"A": 90, "B": 80, "C": 70, "D": 60}` regardless of what was in the syllabus. If your professor uses a 93/83/73 cutoff (common in engineering courses), "what do I need for an A?" was giving the wrong answer. Fixed by adding `grading_scale` to the `FinalScoreNeededRequest` model and reading targets from it.
-
-### CORS and API base URL were hardcoded to localhost
-
-The CORS whitelist in `main.py` was a literal `["http://localhost:3000"]` and the frontend had `const API_BASE = 'http://localhost:8000'` hardcoded. Deploying either service anywhere — or even running the frontend from a different port — would silently break all API calls. Fixed with an `ALLOWED_ORIGINS` env var on the backend and `REACT_APP_API_BASE` on the frontend, both with sensible localhost defaults so local dev requires zero config changes.
-
-### Grade submission endpoint had no abuse protection
-
-`POST /submit-grades` accepted unlimited entries per request with no rate limiting. Someone could flood it with fake A grades for a course and corrupt the historical distribution data that other users rely on for curve predictions. Fixed with `slowapi` rate limiting (5 req/min per IP) and a hard cap of 20 entries per request. Same rate limiting applied to `/parse-syllabus` (10/min) and `/explain-curve` (30/min) to protect Claude API credits.
-
-### Community template starring was unbounded
-
-`POST /community/star/{template_id}` had no auth and no rate limit — any script could inflate star counts on any template indefinitely. Fixed with a 10/min per-IP rate limit via `slowapi`.
-
-### Dead variable in `calculate_course_grade`
-
-`total_weight` was computed in the loop but never used — the division at the end used `completed_weight` correctly, but `total_weight` just accumulated silently. Removed.
-
-### `what_score_needed` returned `None` for a valid score of 0
-
-The function returned `None` if `needed < 0`, but floating-point arithmetic can produce `-0.00001` when the answer is mathematically `0` (student just needs to submit something). That `None` propagated to the frontend as "impossible" instead of "you just need to turn it in." Fixed with a `-0.05` tolerance and `max(needed, 0.0)` after the guard.
+PyMuPDF reads the PDF (text, tables, and a layout pass for stray `%` labels). The interesting chunk gets sent to Claude with a strict JSON shape. If JSON or weight totals are off, the backend may retry once. Successful parses can update the per-course template table for future users.
 
 ---
 

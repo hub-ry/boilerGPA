@@ -315,8 +315,52 @@ def get_grade_distribution(
         if result:
             return result
 
-    # 3. course-level fallback
-    return _query("", [])
+    # 3. course-level fallback (crowdsourced)
+    result = _query("", [])
+    if result:
+        return result
+
+    # 4. historical BoilerGrades data
+    return _get_historical_distribution(subject, number, instructor_last)
+
+
+def _get_historical_distribution(
+    subject: str,
+    number: str,
+    instructor_last: str,
+) -> Optional[dict]:
+    """
+    Fall back to imported BoilerGrades historical data.
+    Tries instructor-specific first, then course-level average.
+    Returns same dict shape as get_grade_distribution: {a_count…f_count, total}.
+    """
+    def _hquery(extra_where: str, params: list) -> Optional[dict]:
+        with get_db() as conn:
+            row = conn.execute(
+                f"""
+                SELECT
+                    AVG(a_count) AS a_count,
+                    AVG(b_count) AS b_count,
+                    AVG(c_count) AS c_count,
+                    AVG(d_count) AS d_count,
+                    AVG(f_count) AS f_count,
+                    100          AS total
+                FROM historical_grade_stats
+                WHERE subject = ? AND number = ?
+                {extra_where}
+                """,
+                [subject.upper(), number] + params,
+            ).fetchone()
+        if row and row["a_count"] is not None:
+            return dict(row)
+        return None
+
+    if instructor_last and instructor_last not in ("staff", "tba", ""):
+        result = _hquery("AND LOWER(instructor) LIKE ?", [f"%{instructor_last.lower()}%"])
+        if result:
+            return result
+
+    return _hquery("", [])
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +611,59 @@ def list_scraped_semesters() -> list[dict]:
             "SELECT semester, COUNT(*) AS count FROM courses GROUP BY semester ORDER BY semester"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def ensure_historical_table() -> None:
+    """Create the historical_grade_stats table if it doesn't exist."""
+    with get_db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS historical_grade_stats (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject     TEXT    NOT NULL,
+                number      TEXT    NOT NULL,
+                instructor  TEXT    NOT NULL DEFAULT '',
+                year        INTEGER NOT NULL DEFAULT 0,
+                semester    TEXT    NOT NULL DEFAULT '',
+                a_count     REAL    NOT NULL DEFAULT 0,
+                b_count     REAL    NOT NULL DEFAULT 0,
+                c_count     REAL    NOT NULL DEFAULT 0,
+                d_count     REAL    NOT NULL DEFAULT 0,
+                f_count     REAL    NOT NULL DEFAULT 0,
+                total       REAL    NOT NULL DEFAULT 100,
+                UNIQUE(subject, number, instructor, year, semester)
+            );
+            CREATE INDEX IF NOT EXISTS idx_historical_lookup
+                ON historical_grade_stats(subject, number, instructor);
+        """)
+
+
+def bulk_insert_historical(rows: list[dict]) -> tuple[int, int]:
+    """
+    Upsert historical grade stats rows.
+    Returns (inserted, skipped) counts.
+    """
+    inserted = skipped = 0
+    with get_db() as conn:
+        for r in rows:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO historical_grade_stats
+                    (subject, number, instructor, year, semester,
+                     a_count, b_count, c_count, d_count, f_count, total)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    r["subject"].upper(), r["number"], r["instructor"],
+                    r["year"], r["semester"],
+                    r["a_count"], r["b_count"], r["c_count"], r["d_count"], r["f_count"],
+                    r["total"],
+                ),
+            )
+            if cur.rowcount:
+                inserted += 1
+            else:
+                skipped += 1
+    return inserted, skipped
 
 
 def get_submission_stats() -> dict:

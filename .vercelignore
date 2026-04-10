@@ -1,0 +1,10 @@
+backend/
+frontend/
+.venv/
+export_grades.py
+*.py
+*.pyc
+__pycache__/
+*.db
+*.db-shm
+*.db-wal

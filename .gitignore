@@ -69,3 +69,4 @@ logs/
 
 .claude/
 *.claude
+.vercel

@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #0f0f0f;
+  color: #ffffff;
+}
+
+/* Purdue theme */
+.glass-card {
+  @apply rounded border border-white/10 bg-white/5 backdrop-blur-md;
+}
+
+.button-primary {
+  @apply rounded-sm bg-gold-500 text-charcoal-950 px-4 py-2 font-semibold hover:bg-gold-600 transition-colors;
+}
+
+.button-secondary {
+  @apply rounded-sm border border-charcoal-500 bg-transparent text-white px-4 py-2 font-semibold hover:bg-charcoal-700 transition-colors;
+}
